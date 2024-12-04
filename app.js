@@ -82,19 +82,6 @@ app.put('/CategorieEdit/:id', (req, res) => {
 });
 
 // Supprimer une catégorie
-app.delete('/CategorieDelete/:id', async (req, res) => {
-    try {
-        const categorie = await Categorie.findByIdAndDelete(req.params.id);
-        if (!categorie) {
-            return res.status(404).json({ message: 'Categorie not found' });
-        }
-        res.status(200).json({ message: 'Categorie deleted successfully' });
-    } catch (error) {
-        res.status(500).json({ message: 'Erreur serveur', error });
-    }
-});
-
-// Supprimer une catégorie
 app.delete('/CategorieDelete/:id', (req, res) => {
     const query = 'DELETE FROM categories WHERE id = ?';
     db.query(query, [req.params.id], (err, results) => {
