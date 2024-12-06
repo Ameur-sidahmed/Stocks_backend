@@ -1,19 +1,23 @@
 const express = require('express');
+const cors = require('cors');
+const db = require('./databases/cnx.js'); // Assurez-vous que cnx.js est correctement configuré
+
 const app = express();
 const port = 3000;
-const db = require('./databases/cnx.js')
-const cors = require('cors'); // Importer le middleware CORS
-app.use(cors());
 
-// Middleware pour parser le JSON
+// Middleware
+app.use(cors());
 app.use(express.json());
-db.connect((err) => {
-    if (err) {
+
+// Tester la connexion à la base de données
+db.query('SELECT 1')
+    .then(() => {
+        console.log('Connecté à la base de données MySQL!');
+    })
+    .catch((err) => {
         console.error('Erreur de connexion à la base de données :', err);
-        process.exit(1); // Arrêter le serveur si la base de données est inaccessible
-    }
-    console.log('Connecté à la base de données MySQL!');
-});
+        process.exit(1); // Arrêter le serveur si la connexion échoue
+    });
 //les Api Categories
 // Lire toutes les catégories
 app.get('/CategorieAll', (req, res) => {
@@ -186,11 +190,10 @@ app.delete('/ProduitDelete/:id', (req, res) => {
 
 // Les API Factures
 // Lire toutes les factures
-app.get('/FacturesAll', (req, res) => {
-    const query = 'SELECT id, nom_client, prix_total, date_creation FROM factures';
-    db.query(query, (err, results) => {
-        if (err) return res.status(500).json({ message: 'Erreur serveur', error: err });
-
+app.get('/FacturesAll', async (req, res) => {
+    try {
+        const [results] = await db.query('SELECT id, nom_client, prix_total, date_creation FROM factures');
+        
         if (results.length === 0) {
             return res.status(404).json({ message: 'Aucune facture trouvée' });
         }
@@ -206,10 +209,12 @@ app.get('/FacturesAll', (req, res) => {
             data: factures,
             message: 'success'
         });
-    });
+    } catch (err) {
+        res.status(500).json({ message: 'Erreur serveur', error: err });
+    }
 });
 
-// Ajouter une facture
+// Ajouter une facture avec gestion des stocks
 app.post('/FactureSave', async (req, res) => {
     const { nom_client, produits } = req.body;
 
@@ -218,9 +223,12 @@ app.post('/FactureSave', async (req, res) => {
         return res.status(400).json({ message: 'Le nom du client et les produits sont requis' });
     }
 
+    let conn;
+
     try {
-        // Démarrer une transaction
-        await db.beginTransaction();
+        // Acquérir une connexion du pool
+        conn = await db.getConnection();
+        await conn.beginTransaction();
 
         // Vérifier la disponibilité des produits et calculer le prix total
         let prix_total = 0;
@@ -230,46 +238,56 @@ app.post('/FactureSave', async (req, res) => {
             const { produit_id, quantite } = produit;
 
             if (!produit_id || quantite <= 0) {
+                await conn.rollback();
                 return res.status(400).json({ message: 'Chaque produit doit avoir un ID et une quantité valide' });
             }
 
             // Vérifier la disponibilité du produit dans le stock
-            const queryStock = 'SELECT nom, quantite, prix_vente FROM produits WHERE id = ?';
-            const [stockResult] = await db.query(queryStock, [produit_id]);
+            const [stockResults] = await conn.query('SELECT nom, quantite, prix_vente FROM produits WHERE id = ?', [produit_id]);
 
-            if (!stockResult || stockResult.quantite < quantite) {
-                throw new Error(`Le produit ${stockResult ? stockResult.nom : 'inconnu'} n'a pas assez de stock.`);
+            if (stockResults.length === 0) {
+                await conn.rollback();
+                return res.status(404).json({ message: `Le produit avec l'ID ${produit_id} n'existe pas.` });
+            }
+
+            const stock = stockResults[0];
+
+            if (stock.quantite < quantite) {
+                await conn.rollback();
+                return res.status(400).json({ message: `Le produit ${stock.nom} n'a pas assez de stock.` });
             }
 
             // Ajouter le produit validé à la liste
             produitsVerifies.push({
                 produit_id,
                 quantite,
-                prix_vente: stockResult.prix_vente,
-                nom: stockResult.nom
+                prix_vente: stock.prix_vente,
+                nom: stock.nom
             });
 
-            prix_total += stockResult.prix_vente * quantite;
+            prix_total += stock.prix_vente * quantite;
         }
 
-        // Insérer la facture
-        const queryFacture = 'INSERT INTO factures (nom_client, prix_total, date_creation) VALUES (?, ?, NOW())';
-        const [factureResult] = await db.query(queryFacture, [nom_client, prix_total]);
+        // Insérer la facture avec le prix total calculé
+        const [factureResult] = await conn.query(
+            'INSERT INTO factures (nom_client, prix_total, date_creation) VALUES (?, ?, NOW())',
+            [nom_client, prix_total]
+        );
         const factureId = factureResult.insertId;
 
-        // Insérer les produits de la facture
-        const queryArticles = 'INSERT INTO articles_facture (facture_id, produit_id, quantite) VALUES ?';
+        // Préparer les données pour insérer dans `articles_facture`
         const articlesData = produitsVerifies.map((p) => [factureId, p.produit_id, p.quantite]);
-        await db.query(queryArticles, [articlesData]);
+
+        // Insérer les articles de la facture
+        await conn.query('INSERT INTO articles_facture (facture_id, produit_id, quantite) VALUES ?', [articlesData]);
 
         // Mettre à jour les stocks
         for (let produit of produitsVerifies) {
-            const queryUpdateStock = 'UPDATE produits SET quantite = quantite - ? WHERE id = ?';
-            await db.query(queryUpdateStock, [produit.quantite, produit.produit_id]);
+            await conn.query('UPDATE produits SET quantite = quantite - ? WHERE id = ?', [produit.quantite, produit.produit_id]);
         }
 
         // Valider la transaction
-        await db.commit();
+        await conn.commit();
 
         res.status(201).json({
             message: 'Facture créée avec succès',
@@ -281,24 +299,27 @@ app.post('/FactureSave', async (req, res) => {
             }
         });
     } catch (error) {
-        // Annuler la transaction en cas d'erreur
-        await db.rollback();
+        if (conn) await conn.rollback();
+        console.error('Erreur lors de l\'ajout de la facture :', error);
         res.status(500).json({ message: 'Erreur serveur', error: error.message });
+    } finally {
+        if (conn) conn.release(); // Libérer la connexion
     }
 });
 
-
 // Mettre à jour une facture
-app.put('/FacturesEdit/:id', (req, res) => {
+app.put('/FacturesEdit/:id', async (req, res) => {
     const { nom_client, prix_total } = req.body;
 
     if (!nom_client || !prix_total) {
         return res.status(400).json({ message: 'Le nom du client et le prix total sont requis' });
     }
 
-    const query = 'UPDATE factures SET nom_client = ?, prix_total = ?, date_creation = NOW() WHERE id = ?';
-    db.query(query, [nom_client, prix_total, req.params.id], (err, results) => {
-        if (err) return res.status(500).json({ message: 'Erreur serveur', error: err });
+    try {
+        const [results] = await db.query(
+            'UPDATE factures SET nom_client = ?, prix_total = ?, date_creation = NOW() WHERE id = ?',
+            [nom_client, prix_total, req.params.id]
+        );
 
         if (results.affectedRows === 0) {
             return res.status(404).json({ message: 'Facture non trouvée' });
@@ -308,23 +329,24 @@ app.put('/FacturesEdit/:id', (req, res) => {
             data: { id: req.params.id, nom_client, prix_total },
             message: 'Facture mise à jour avec succès'
         });
-    });
+    } catch (err) {
+        res.status(500).json({ message: 'Erreur serveur', error: err });
+    }
 });
 
 // Supprimer une facture
-app.delete('/FacturesDelete/:id', (req, res) => {
-    const query = 'DELETE FROM factures WHERE id = ?';
-    db.query(query, [req.params.id], (err, results) => {
-        if (err) return res.status(500).json({ message: 'Erreur serveur', error: err });
+app.delete('/FacturesDelete/:id', async (req, res) => {
+    try {
+        const [results] = await db.query('DELETE FROM factures WHERE id = ?', [req.params.id]);
 
         if (results.affectedRows === 0) {
             return res.status(404).json({ message: 'Facture non trouvée' });
         }
-
         res.status(200).json({ message: 'Facture supprimée avec succès' });
-    });
+         } catch (err) {
+        res.status(500).json({ message: 'Erreur serveur', error: err });
+    }
 });
-
 
 
 // Démarrer le serveur
